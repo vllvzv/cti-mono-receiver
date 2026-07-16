@@ -110,7 +110,7 @@ app.post("/", express.raw({ type: () => true, limit: "2mb" }), async (req: Reque
 app.get("/account-info", requireWebhookSecret, async (_req: Request, res: Response) => {
   try {
     const clientInfo = await getClientInfo(MONO_TOKEN);
-    res.json({ accounts: clientInfo.accounts });
+    res.json({ clientName: clientInfo.name, accounts: clientInfo.accounts });
   } catch (err) {
     console.error("[account-info] failed:", err);
     res.status(502).json({ error: "Failed to fetch account info from monobank" });

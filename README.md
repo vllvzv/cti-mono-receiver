@@ -18,7 +18,10 @@ plan is to move it into its own GitHub repo for Railway to deploy from.
   502 to monobank so its own webhook retry mechanism can redeliver later.
 - `GET /account-info` — requires header `X-Webhook-Secret` matching the
   `WEBHOOK_SECRET` env var (401 otherwise). Calls monobank `client-info` with
-  `MONO_TOKEN` and returns the account list.
+  `MONO_TOKEN` and returns `{ clientName, accounts }` — `clientName` is the
+  account owner's name as registered with monobank (there is no separate
+  EDRPOU/INN field in this API), for the caller to visually cross-check
+  against the FOP it expects to be connecting.
 - `POST /register-webhook` — same `X-Webhook-Secret` check, body
   `{ "accountId": string }`. Registers this service's own public URL as the
   monobank webhook for `MONO_TOKEN`.

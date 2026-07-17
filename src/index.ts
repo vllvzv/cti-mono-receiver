@@ -1,5 +1,7 @@
 import "dotenv/config";
 import { timingSafeEqual } from "node:crypto";
+import { appendFile } from "node:fs/promises";
+import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { getClientInfo, setWebhook } from "./monobankApi";
 
@@ -7,6 +9,13 @@ const MONO_TOKEN = requireEnv("MONO_TOKEN");
 const BOT_INCOMING_URL = requireEnv("BOT_INCOMING_URL");
 const WEBHOOK_SECRET = requireEnv("WEBHOOK_SECRET");
 const PORT = Number(process.env.PORT ?? 3000);
+
+// No DB access from this service (deliberately minimal, no Prisma/DATABASE_URL — see
+// package.json). Railway's local filesystem is ephemeral (wiped on redeploy/restart),
+// so this file is a best-effort recovery aid, not durable storage — the error-level
+// console.error below is the actually durable trail, since Railway's own log platform
+// persists stdout/stderr independently of the container's disk.
+const FAILED_FORWARDS_LOG_PATH = process.env.FAILED_FORWARDS_LOG_PATH ?? path.join(process.cwd(), "failed_forwards.log");
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -56,10 +65,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// See mono_api_railway_multi_user_plan.md, open question 8.1: retry a bounded
-// number of times before giving up. If every attempt fails, we respond
-// non-2xx to monobank so its own webhook retry mechanism has a chance to
-// redeliver later, instead of silently dropping the transaction.
+// See mono_api_railway_multi_user_plan.md, open question 8.1: retry a bounded number
+// of times before giving up. monobank itself is no longer asked to redeliver on
+// failure (we ack it 200 immediately, before forwarding even starts — see the POST "/"
+// handler below), so if every attempt here fails, the transaction is only recoverable
+// via recordFailedForward's error log / failed_forwards.log — there is no automatic
+// retry beyond FORWARD_MAX_ATTEMPTS.
 const FORWARD_MAX_ATTEMPTS = 3;
 const FORWARD_BACKOFF_MS = [500, 1500];
 
@@ -92,19 +103,79 @@ async function forwardToBot(rawBody: Buffer, contentType: string | undefined): P
   return false;
 }
 
+type FailedForwardStatementItem = {
+  id?: string;
+  time?: number;
+  description?: string;
+  amount?: number;
+};
+
+type FailedForwardPayload = {
+  type?: string;
+  data?: {
+    account?: string;
+    statementItem?: FailedForwardStatementItem;
+  };
+};
+
+// Manual-recovery aid for a transaction that could not be forwarded after
+// FORWARD_MAX_ATTEMPTS — see the comment above forwardToBot. Never retries or
+// re-queues anything itself; it only makes the loss visible and inspectable.
+async function recordFailedForward(rawBody: Buffer): Promise<void> {
+  let parsed: FailedForwardPayload | null = null;
+  try {
+    parsed = JSON.parse(rawBody.toString("utf8")) as FailedForwardPayload;
+  } catch {
+    // Not valid JSON — record will fall back to the raw body string below.
+  }
+
+  const item = parsed?.data?.statementItem;
+
+  const record = {
+    loggedAt: new Date().toISOString(),
+    monoTransactionId: item?.id ?? null,
+    amount: item?.amount ?? null,
+    description: item?.description ?? null,
+    time: item?.time ?? null,
+    rawPayload: parsed ?? rawBody.toString("utf8"),
+  };
+
+  console.error("[forward] FAILED after all retries — transaction not delivered to bot, needs manual recovery", JSON.stringify(record));
+
+  try {
+    await appendFile(FAILED_FORWARDS_LOG_PATH, JSON.stringify(record) + "\n", "utf8");
+  } catch (err) {
+    console.error("[forward] additionally failed to write failed_forwards.log:", err);
+  }
+}
+
 const app = express();
+
+app.get("/health", (_req: Request, res: Response) => {
+  res.sendStatus(200);
+});
 
 // Raw body capture for the monobank inbound webhook: forwarded byte-for-byte,
 // so no JSON parsing here.
-app.post("/", express.raw({ type: () => true, limit: "2mb" }), async (req: Request, res: Response) => {
+//
+// Acks monobank immediately, before forwarding — forwardToBot's own retry loop
+// (up to 3 attempts, 500ms/1500ms backoff) previously ran *before* this response,
+// so a slow bot or a transient network blip on attempt 1 could push our own
+// response past monobank's webhook timeout and trigger a monobank-level redelivery
+// of the same transaction. The bot's /mono/incoming endpoint already deduplicates
+// by monobank transaction id, so that redelivery was mostly harmless, but there's
+// no reason to risk it (or the extra latency) when acking fast costs nothing here.
+app.post("/", express.raw({ type: () => true, limit: "2mb" }), (req: Request, res: Response) => {
   const rawBody = req.body instanceof Buffer ? req.body : Buffer.from([]);
+  const contentType = req.header("Content-Type");
 
-  const forwarded = await forwardToBot(rawBody, req.header("Content-Type"));
-  if (forwarded) {
-    res.sendStatus(200);
-  } else {
-    res.sendStatus(502);
-  }
+  res.sendStatus(200);
+
+  void forwardToBot(rawBody, contentType).then((forwarded) => {
+    if (!forwarded) {
+      void recordFailedForward(rawBody);
+    }
+  });
 });
 
 app.get("/account-info", requireWebhookSecret, async (_req: Request, res: Response) => {

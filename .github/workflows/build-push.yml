@@ -1,6 +1,8 @@
-name: Build and push test image
+name: Build and push image
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -25,4 +27,6 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/vllvzv/cti-mono-receiver:test
+          tags: |
+            ghcr.io/vllvzv/cti-mono-receiver:test
+            ghcr.io/vllvzv/cti-mono-receiver:latest

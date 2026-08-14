@@ -3,7 +3,7 @@ import { timingSafeEqual } from "node:crypto";
 import { appendFile } from "node:fs/promises";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
-import { getClientInfo, setWebhook } from "./monobankApi";
+import { getClientInfo, setWebhook, MonobankApiError } from "./monobankApi";
 
 const MONO_TOKEN = requireEnv("MONO_TOKEN");
 const BOT_INCOMING_URL = requireEnv("BOT_INCOMING_URL");
@@ -184,7 +184,16 @@ app.get("/account-info", requireWebhookSecret, async (_req: Request, res: Respon
     res.json({ clientName: clientInfo.name, accounts: clientInfo.accounts });
   } catch (err) {
     console.error("[account-info] failed:", err);
-    res.status(502).json({ error: "Failed to fetch account info from monobank" });
+    // MonobankApiError carries the real HTTP status Monobank responded with (401/403
+    // invalid token, 429 rate limit, 5xx, etc.) — forward it as `monobankStatus` so the
+    // bot can tell "invalid token" apart from "transient, try again" instead of collapsing
+    // everything into one generic message. A network/timeout failure never reaches
+    // Monobank at all, so it has no such status — that case still falls back to 502.
+    if (err instanceof MonobankApiError && err.status !== undefined) {
+      res.status(err.status).json({ error: err.message, monobankStatus: err.status });
+    } else {
+      res.status(502).json({ error: "Failed to reach Monobank API" });
+    }
   }
 });
 

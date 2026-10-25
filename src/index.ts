@@ -70,9 +70,12 @@ function sleep(ms: number): Promise<void> {
 // failure (we ack it 200 immediately, before forwarding even starts — see the POST "/"
 // handler below), so if every attempt here fails, the transaction is only recoverable
 // via recordFailedForward's error log / failed_forwards.log — there is no automatic
-// retry beyond FORWARD_MAX_ATTEMPTS.
-const FORWARD_MAX_ATTEMPTS = 3;
-const FORWARD_BACKOFF_MS = [500, 1500];
+// retry beyond FORWARD_MAX_ATTEMPTS. ~8.5 min in total: outlasts a bot deploy (~13 s
+// without a listener) and short Railway outages. Retries are safe — the bot deduplicates
+// by monobank transaction id. They live in memory, so a restart of this service drops them.
+const FORWARD_BACKOFF_MS = [1_000, 5_000, 15_000, 60_000, 120_000, 300_000];
+const FORWARD_MAX_ATTEMPTS = FORWARD_BACKOFF_MS.length + 1;
+const FORWARD_TIMEOUT_MS = 10_000;
 
 async function forwardToBot(rawBody: Buffer, contentType: string | undefined): Promise<boolean> {
   for (let attempt = 1; attempt <= FORWARD_MAX_ATTEMPTS; attempt++) {
@@ -84,6 +87,7 @@ async function forwardToBot(rawBody: Buffer, contentType: string | undefined): P
           "X-Webhook-Secret": WEBHOOK_SECRET,
         },
         body: new Uint8Array(rawBody),
+        signal: AbortSignal.timeout(FORWARD_TIMEOUT_MS),
       });
 
       if (response.ok) {
@@ -91,6 +95,11 @@ async function forwardToBot(rawBody: Buffer, contentType: string | undefined): P
       }
 
       console.error(`[forward] bot responded ${response.status} (attempt ${attempt}/${FORWARD_MAX_ATTEMPTS})`);
+
+      // 401/403/404 etc. won't change on retry (wrong secret or URL); 429 and 5xx might.
+      if (response.status < 500 && response.status !== 429) {
+        return false;
+      }
     } catch (err) {
       console.error(`[forward] attempt ${attempt}/${FORWARD_MAX_ATTEMPTS} failed:`, err);
     }
@@ -159,7 +168,7 @@ app.get("/health", (_req: Request, res: Response) => {
 // so no JSON parsing here.
 //
 // Acks monobank immediately, before forwarding — forwardToBot's own retry loop
-// (up to 3 attempts, 500ms/1500ms backoff) previously ran *before* this response,
+// previously ran *before* this response,
 // so a slow bot or a transient network blip on attempt 1 could push our own
 // response past monobank's webhook timeout and trigger a monobank-level redelivery
 // of the same transaction. The bot's /mono/incoming endpoint already deduplicates

@@ -13,9 +13,10 @@ plan is to move it into its own GitHub repo for Railway to deploy from.
 
 - `POST /` — inbound webhook from monobank (no auth, monobank itself calls
   this). Forwards the raw request body to `BOT_INCOMING_URL` with header
-  `X-Webhook-Secret: ${WEBHOOK_SECRET}`. Retries up to 3 times with backoff
-  (500ms, 1500ms) if the bot is unreachable; if all attempts fail, responds
-  502 to monobank so its own webhook retry mechanism can redeliver later.
+  `X-Webhook-Secret: ${WEBHOOK_SECRET}`. Acks monobank with 200 before
+  forwarding. On a network error, timeout (10 s), 5xx or 429 retries up to 7
+  times (1 s, 5 s, 15 s, 1 min, 2 min, 5 min); other 4xx are not retried. A
+  forward that never succeeds is logged and appended to `failed_forwards.log`.
 - `GET /account-info` — requires header `X-Webhook-Secret` matching the
   `WEBHOOK_SECRET` env var (401 otherwise). Calls monobank `client-info` with
   `MONO_TOKEN` and returns `{ clientName, accounts }` — `clientName` is the
